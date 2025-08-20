@@ -1,0 +1,419 @@
+module airfryer(
+    input clk,
+    input switch_on,
+    input dip_mode,
+    input btn_up,
+    input btn_down,
+    input btn_start,
+    input btn_pause,       
+    input btn_prog,        
+    input limit_switch,    
+    output reg a1, b1, c1, d1, e1, f1, g1,
+    output reg a2, b2, c2, d2, e2, f2, g2,
+    output reg a3, b3, c3, d3, e3, f3, g3,
+    output reg buzzer       
+);
+
+    reg [28:0] counter; 
+    reg [26:0] sec_counter;
+
+    reg [8:0] temp = 9'd350;
+    reg [8:0] time_val = 9'd0;
+    reg mode = 0;
+
+    // Estados para mostrar en display
+    reg show_on = 0;
+    reg show_off = 0;
+    reg show_temp = 0;
+    reg show_pre = 0;
+    reg show_add = 0;
+    reg show_cook = 0;
+    reg show_end = 0;
+    reg show_open = 0;
+    reg show_pause = 0;
+
+    // Contadores de minutos y segundos para la cocción
+    reg [7:0] cook_minutes = 0;
+    reg [5:0] cook_seconds = 0;
+
+    // Contador para programa predefinido
+    reg [2:0] prog_count = 0; // cuenta de 0 a 4 (5 estados)
+
+    // Contadores y flags para buzzer
+    reg [23:0] buzzer_counter = 0;
+    reg buzzer_active = 0;
+
+    // Contador para buzzer intermitente (ADD y END)
+    reg [25:0] buzzer_int_counter = 0; 
+    reg buzzer_int_state = 0;
+
+    // Señales con debounce
+    wire btn_up_db, btn_down_db, btn_start_db, btn_pause_db, btn_switch_db, btn_prog_db, limit_switch_db;
+    debounce db_up(clk, btn_up, btn_up_db);
+    debounce db_down(clk, btn_down, btn_down_db);
+    debounce db_start(clk, btn_start, btn_start_db);
+    debounce db_pause(clk, btn_pause, btn_pause_db);
+    debounce db_switch(clk, switch_on, btn_switch_db);
+    debounce db_prog(clk, btn_prog, btn_prog_db);
+    debounce db_limit(clk, limit_switch, limit_switch_db);
+
+    // Registros para detectar flancos
+    reg prev_switch, prev_btn_up, prev_btn_down, prev_btn_start, prev_btn_pause, prev_btn_prog;
+
+    wire btn_up_posedge    = (btn_up_db    && !prev_btn_up);
+    wire btn_down_posedge  = (btn_down_db  && !prev_btn_down);
+    wire btn_start_posedge = (btn_start_db && !prev_btn_start);
+    wire btn_pause_posedge = (btn_pause_db && !prev_btn_pause);
+    wire btn_prog_posedge  = (btn_prog_db  && !prev_btn_prog);
+
+    wire [3:0] centenas = temp / 100;
+    wire [3:0] decenas  = (mode == 0) ? (temp % 100) / 10 : time_val / 10;
+    wire [3:0] unidades = (mode == 0) ? temp % 10 : time_val % 10;
+
+    always @(posedge clk) begin
+        prev_switch    <= btn_switch_db;
+        prev_btn_up    <= btn_up_db;
+        prev_btn_down  <= btn_down_db;
+        prev_btn_start <= btn_start_db;
+        prev_btn_pause <= btn_pause_db;
+        prev_btn_prog  <= btn_prog_db;
+
+        // Buzzer se activa cuando se presiona cualquier botón (buzzer breve)
+        if (btn_up_posedge || btn_down_posedge || btn_start_posedge || btn_pause_posedge || btn_prog_posedge) begin
+            buzzer_active <= 1;
+            buzzer_counter <= 0;
+        end
+
+        if (buzzer_active) begin
+            if (buzzer_counter < 24'd1_000_000) begin
+                buzzer_counter <= buzzer_counter + 1;
+            end else begin
+                buzzer_active <= 0;
+                buzzer_counter <= 0;
+            end
+        end
+
+        // Buzzer intermitente para estados ADD y END (1 segundo ON, 1 segundo OFF)
+        if (show_add || show_end) begin
+            if (buzzer_int_counter < 26'd49_999_999) begin
+                buzzer_int_counter <= buzzer_int_counter + 1;
+            end else begin
+                buzzer_int_counter <= 0;
+                buzzer_int_state <= ~buzzer_int_state;
+            end
+        end else begin
+            buzzer_int_counter <= 0;
+            buzzer_int_state <= 0;
+        end
+
+        // El buzzer sale activo si buzzer_active o buzzer intermitente está ON
+        buzzer <= buzzer_active | buzzer_int_state;
+
+        // Encendido
+        if (prev_switch == 0 && btn_switch_db == 1) begin
+            show_on <= 1;
+            show_off <= 0;
+            show_temp <= 0;
+            show_pre <= 0;
+            show_add <= 0;
+            show_cook <= 0;
+            show_end <= 0;
+            show_open <= 0;
+            show_pause <= 0;
+            counter <= 0;
+            sec_counter <= 0;
+            temp <= 9'd350;
+            time_val <= 9'd0;
+            mode <= dip_mode;
+            cook_minutes <= 0;
+            cook_seconds <= 0;
+            prog_count <= 0;  
+        end
+
+        // Apagado
+        if (prev_switch == 1 && btn_switch_db == 0) begin
+            show_off <= 1;
+            show_on <= 0;
+            show_temp <= 0;
+            show_pre <= 0;
+            show_add <= 0;
+            show_cook <= 0;
+            show_end <= 0;
+            show_open <= 0;
+            show_pause <= 0;
+            counter <= 0;
+            sec_counter <= 0;
+            cook_minutes <= 0;
+            cook_seconds <= 0;
+        end
+
+        // Mostrar ON/OFF 2 segundos
+        if (show_on || show_off) begin
+            if (counter < 28'd100_000_000) begin
+                counter <= counter + 1;
+            end else begin
+                if (show_on) begin
+                    show_on <= 0;
+                    show_temp <= 1;
+                end else if (show_off) begin
+                    show_off <= 0;
+                    show_temp <= 0;
+                end
+                counter <= 0;
+            end
+        end
+
+        // PRE: contar 120 segundos reales (2 minutos)
+        if (show_pre) begin
+            if (sec_counter < 26'd49_999_999) begin
+                sec_counter <= sec_counter + 1;
+            end else begin
+                sec_counter <= 0;
+                if (counter < 119) begin
+                    counter <= counter + 1;
+                end else begin
+                    show_pre <= 0;
+                    show_add <= 1;
+                    counter <= 0;
+                end
+            end
+        end
+
+        // ADD: mostrar "ADD" 10 segundos
+        if (show_add) begin
+            if (counter < 29'd500_000_000) begin
+                counter <= counter + 1;
+            end else begin
+                counter <= 0;
+                show_add <= 0;
+                show_cook <= 1;
+                cook_minutes <= time_val;
+                cook_seconds <= 0;
+            end
+        end
+
+        // COOK: manejar tiempo
+        if (show_cook) begin
+            if (limit_switch_db) begin
+                if (cook_minutes == 0 && cook_seconds == 0) begin
+                    show_cook <= 0;
+                    show_end <= 1;
+                    counter <= 0;
+                end else begin
+                    if (sec_counter < 26'd49_999_999) begin
+                        sec_counter <= sec_counter + 1;
+                    end else begin
+                        sec_counter <= 0;
+                        if (cook_seconds > 0) begin
+                            cook_seconds <= cook_seconds - 1;
+                        end else if (cook_minutes > 0) begin
+                            cook_minutes <= cook_minutes - 1;
+                            cook_seconds <= 6'd59;
+                        end
+                    end
+                end
+            end else begin
+                show_cook <= 0;
+                show_open <= 1;
+            end
+        end
+
+        // Mostrar A cuando puerta abierta y mantener tiempo
+        if (show_open) begin
+            if (limit_switch_db) begin
+                show_open <= 0;
+                show_cook <= 1;
+            end
+        end
+
+        // END: mostrar "END" 10 segundos con buzzer intermitente antes de volver al inicio
+        if (show_end) begin
+            if (counter < 29'd500_000_000) begin  
+                counter <= counter + 1;
+            end else begin
+                // Después de 10 segundos, volver al estado inicial
+                show_end <= 0;
+                show_temp <= 1;
+                show_on <= 0;
+                show_off <= 0;
+                show_pre <= 0;
+                show_add <= 0;
+                show_cook <= 0;
+                show_open <= 0;
+                show_pause <= 0;
+                counter <= 0;
+                sec_counter <= 0;
+                cook_minutes <= 0;
+                cook_seconds <= 0;
+                temp <= 9'd350;
+                time_val <= 9'd0;
+                mode <= dip_mode;
+                prog_count <= 0;
+            end
+        end
+
+        // Botón START inicia PRE o reanuda COOK desde PAUSE solo si puerta cerrada
+        if (btn_start_posedge) begin
+            if (show_temp && !show_pre && !show_cook && !show_end && !show_pause && limit_switch_db) begin
+                show_pre <= 1;
+                show_temp <= 0;
+                sec_counter <= 0;
+                counter <= 0;
+            end else if (show_pause && limit_switch_db) begin
+                show_pause <= 0;
+                show_cook <= 1;
+                counter <= 0;
+                sec_counter <= 0;
+            end
+        end
+
+        // Botón PAUSA: pausa o cancela
+        if (btn_pause_posedge) begin
+            if (show_cook) begin
+                show_cook <= 0;
+                show_pause <= 1;
+            end else if (show_pause) begin
+                show_pause <= 0;
+                show_end <= 1;
+                counter <= 0;
+            end else if (show_open) begin
+                show_open <= 0;
+                show_end <= 1;
+                counter <= 0;
+            end else if (show_pre) begin
+                // Cancelar el PRE y pasar a END
+                show_pre <= 0;
+                show_end <= 1;
+                counter <= 0;
+            end
+        end
+
+        // Botón PROG para seleccionar programa predefinido
+        if (btn_prog_posedge) begin
+            if (prog_count == 4) begin
+                prog_count <= 0;
+                temp <= 9'd350;
+                time_val <= 9'd0;
+            end else begin
+                prog_count <= prog_count + 1;
+                case (prog_count + 1)
+                    1: begin temp <= 9'd375; time_val <= 9'd15; end
+                    2: begin temp <= 9'd450; time_val <= 9'd25; end
+                    3: begin temp <= 9'd135; time_val <= 9'd12; end
+                    4: begin temp <= 9'd225; time_val <= 9'd40; end
+                endcase
+            end
+        end
+
+        // Ajustar modo según dip_mode siempre
+        mode <= dip_mode;
+
+        // Cambios con UP/DOWN solo en modo normal
+        if (prog_count == 0) begin
+            if (show_temp && !show_pre && !show_cook && !show_end && !show_pause && !show_add) begin
+                if (mode == 0) begin
+                    if (btn_up_posedge   && (temp <= 9'd445)) temp <= temp + 9'd5;
+                    if (btn_down_posedge && (temp >= 9'd125)) temp <= temp - 9'd5;
+                end else begin
+                    if (btn_up_posedge   && (time_val <= 9'd98)) time_val <= time_val + 9'd1;
+                    if (btn_down_posedge && (time_val >= 9'd1)) time_val <= time_val - 9'd1;
+                end
+            end
+        end
+    end
+
+    // Lógica para los displays
+    always @(*) begin
+        if (show_on) begin
+            {a1,b1,c1,d1,e1,f1,g1} = digit_to_segments(0); 
+            a2=1; b2=1; c2=1; d2=0; e2=1; f2=1; g2=0;      
+            {a3,b3,c3,d3,e3,f3,g3} = 7'b0000000;
+        end else if (show_off) begin
+            {a1,b1,c1,d1,e1,f1,g1} = digit_to_segments(0); 
+            a2=1; b2=0; c2=0; d2=0; e2=1; f2=1; g2=1;      
+            a3=1; b3=0; c3=0; d3=0; e3=1; f3=1; g3=1;      
+        end else if (show_pre) begin
+            a1=1; b1=1; c1=0; d1=0; e1=1; f1=1; g1=1; 
+            a2=1; b2=1; c2=1; d2=0; e2=1; f2=1; g2=1; 
+            a3=1; b3=0; c3=0; d3=1; e3=1; f3=1; g3=1; 
+        end else if (show_add) begin
+            a1=1; b1=1; c1=1; d1=0; e1=1; f1=1; g1=1; 
+            a2=0; b2=1; c2=1; d2=1; e2=1; f2=0; g2=1; 
+            a3=0; b3=1; c3=1; d3=1; e3=1; f3=0; g3=1; 
+        end else if (show_cook) begin
+            a1=1; b1=0; c1=0; d1=1; e1=1; f1=1; g1=0; 
+            {a2,b2,c2,d2,e2,f2,g2} = digit_to_segments(cook_minutes / 10);
+            {a3,b3,c3,d3,e3,f3,g3} = digit_to_segments(cook_minutes % 10);
+        end else if (show_pause) begin
+            a1=1; b1=1; c1=0; d1=0; e1=1; f1=1; g1=1; 
+            {a2,b2,c2,d2,e2,f2,g2} = digit_to_segments(cook_minutes / 10);
+            {a3,b3,c3,d3,e3,f3,g3} = digit_to_segments(cook_minutes % 10);
+        end else if (show_open) begin
+            a1=1; b1=1; c1=1; d1=0; e1=1; f1=1; g1=1; 
+            {a2,b2,c2,d2,e2,f2,g2} = digit_to_segments(cook_minutes / 10);
+            {a3,b3,c3,d3,e3,f3,g3} = digit_to_segments(cook_minutes % 10);
+        end else if (show_end) begin
+            a1=1; b1=0; c1=0; d1=1; e1=1; f1=1; g1=1; 
+            a2=1; b2=1; c2=1; d2=0; e2=1; f2=1; g2=0; 
+            a3=0; b3=1; c3=1; d3=1; e3=1; f3=0; g3=1; 
+        end else if (show_temp) begin
+            if (mode == 0) begin
+                {a1,b1,c1,d1,e1,f1,g1} = digit_to_segments(centenas);
+                {a2,b2,c2,d2,e2,f2,g2} = digit_to_segments(decenas);
+                {a3,b3,c3,d3,e3,f3,g3} = digit_to_segments(unidades);
+            end else begin
+                {a1,b1,c1,d1,e1,f1,g1} = 7'b0000000;
+                {a2,b2,c2,d2,e2,f2,g2} = digit_to_segments(decenas);
+                {a3,b3,c3,d3,e3,f3,g3} = digit_to_segments(unidades);
+            end
+        end else begin
+            {a1,b1,c1,d1,e1,f1,g1} = 7'b0000000;
+            {a2,b2,c2,d2,e2,f2,g2} = 7'b0000000;
+            {a3,b3,c3,d3,e3,f3,g3} = 7'b0000000;
+        end
+    end
+    // Función para convertir dígito a segmentos 7 segmentos (activo bajo)
+    function [6:0] digit_to_segments;
+        input [3:0] digit;
+        begin
+            case (digit)
+                4'd0: digit_to_segments = 7'b1111110;
+                4'd1: digit_to_segments = 7'b0110000;
+                4'd2: digit_to_segments = 7'b1101101;
+                4'd3: digit_to_segments = 7'b1111001;
+                4'd4: digit_to_segments = 7'b0110011;
+                4'd5: digit_to_segments = 7'b1011011;
+                4'd6: digit_to_segments = 7'b1011111;
+                4'd7: digit_to_segments = 7'b1110000;
+                4'd8: digit_to_segments = 7'b1111111;
+                4'd9: digit_to_segments = 7'b1111011;
+            default: digit_to_segments = 7'b0000000;
+            endcase
+        end
+    endfunction
+
+endmodule
+
+
+module debounce(
+    input clk,
+    input btn_in,
+    output reg btn_out
+);
+    reg [15:0] count = 0;
+    reg btn_sync_0 = 0;
+    reg btn_sync_1 = 0;
+
+    always @(posedge clk) begin
+        btn_sync_0 <= btn_in;
+        btn_sync_1 <= btn_sync_0;
+
+        if (btn_sync_1 == btn_out)
+            count <= 0;
+        else begin
+            count <= count + 1;
+            if (count == 16'hFFFF)
+                btn_out <= btn_sync_1;
+        end
+    end
+endmodule
