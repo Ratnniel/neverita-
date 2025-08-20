@@ -1,0 +1,386 @@
+/*
+   -- Smartfridge Mejorado --
+   Versión definitiva:
+   - Modo Manual: PWM (pin 18) OFF, circularBar_01 muestra valor del 555 (pin 34)
+   - Modo Auto: PWM (pin 18 y pin 33) ON, controlado por slider_01
+   - Segundo PWM (pin 33): 
+     - Modo Manual: Controlado por 555 (pin 34)
+     - Modo Auto: Igual que el primer PWM (slider_01)
+     - Se apaga después de 30 segundos con puerta abierta
+   - Luz interior con apagado lento después de 1 minuto con puerta abierta
+   - Lectura precisa del 555 con divisor de voltaje (12V → 3.3V)
+*/
+
+#define REMOTEXY_MODE__ESP32CORE_BLE
+#define REMOTEXY_BLUETOOTH_NAME "SmartFridge"
+
+#include <BLEDevice.h>
+#include <DHT.h>
+#include <RemoteXY.h>
+
+#pragma pack(push, 1)  
+uint8_t RemoteXY_CONF[] = {
+     255,2,0,14,0,18,1,19,0,0,0,0,25,1,106,200,1,1,14,0,
+  10,30,14,49,48,49,6,26,31,65,85,84,79,0,31,77,65,78,85,65,
+  76,0,4,45,137,18,55,0,6,31,71,71,77,30,30,56,0,6,31,135,
+  0,0,0,0,0,0,200,66,0,0,160,65,0,0,32,65,0,0,0,64,
+  31,0,131,73,106,27,8,2,26,6,31,84,101,109,112,101,114,97,116,117,
+  114,97,0,0,71,5,77,30,30,56,0,6,31,135,0,0,0,0,0,0,
+  200,66,0,0,160,65,0,0,32,65,0,0,0,64,31,0,131,6,106,27,
+  8,2,26,6,31,72,117,109,101,100,97,100,0,0,65,45,75,18,18,120,
+  131,13,125,14,6,2,26,6,31,77,97,110,117,97,108,0,0,131,79,125,
+  14,6,2,26,6,31,65,117,116,111,0,0,131,44,95,20,6,2,27,6,
+  31,80,117,101,114,116,97,0,0,72,8,116,24,24,12,166,140,31,26,0,
+  0,0,0,0,0,200,66,0,0,0,0,72,74,116,24,24,12,166,140,31,
+  26,0,0,0,0,0,0,200,66,0,0,0,0,70,45,106,18,18,24,26,
+  31,0,131,44,127,20,6,2,26,6,31,73,110,116,101,114,105,111,114,0,
+  0 };
+  
+struct {
+    uint8_t pushSwitch_01; // Switch manual/auto
+    int8_t slider_01;      // Control PWM manual
+    float instrument_01;   // Temperatura
+    float instrument_02;   // Humedad
+    uint8_t led_01_r;      // LED RGB Rojo
+    uint8_t led_01_g;      // LED RGB Verde
+    uint8_t led_01_b;      // LED RGB Azul
+    int8_t circularBar_01; // PWM manual (0-100)
+    int8_t circularBar_02; // PWM auto (0-100)
+    uint8_t led_01;        // LED luz interior
+    uint8_t connect_flag;
+} RemoteXY;   
+#pragma pack(pop)
+
+#define DHTPIN 23
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Pines
+const int pinBotonFisico = 4; pushbutton pulso negativo
+const int pinControl = 5; // relay de cambio entre manual y auto entre mosfet 555 y mosfet pwm pin 18
+const int pwmPin = 18;      // Primer PWM
+const int pwmPin2 = 33;     // Segundo PWM
+const int pinLedR = 19;///rgb
+const int pinLedG = 25; ///rgb
+const int pinLedB = 26; /// rgb
+const int pinLuzInterior = 14; /// con mosfet para fade 
+const int pin555 = 34; ///esp32 lee 555 del pot en manual para lcd
+const int pinSensorMH_D0 = 27; //sensor mh series detecta puerta abierta o cerrada 
+
+// Configuración PWM
+const uint32_t frecuenciaPWM = 5000;
+const uint8_t resolucionPWM = 8;
+int dutyCycle = 0;
+int brilloLuzInterior = 0;
+
+// Variables de estado
+bool estadoPinControl = false;
+bool pantallaInicioMostrada = false;
+bool puertaAbierta = false;
+bool ledParpadeando = false;
+bool pwmApagadoPorTiempo = false;
+bool luzApagadaPorTiempo = false;
+bool iniciarApagadoLuz = false;
+unsigned long ultimaLectura = 0;
+unsigned long tiempoPuertaAbierta = 0;
+unsigned long ultimoParpadeo = 0;
+unsigned long ultimoCambioLuz = 0;
+unsigned long inicioApagadoLuz = 0;
+const unsigned long intervaloLectura = 2000;
+const unsigned long tiempoAlarmaPuerta = 30000;  // 30 segundos para alarma
+const unsigned long tiempoApagarPWM = 30000;     // 30 segundos para apagar PWM
+const unsigned long tiempoApagarLuz = 60000;     // 60 segundos para iniciar apagado luz
+const unsigned long intervaloParpadeo = 500;
+const unsigned long intervaloFadeLuz = 20;
+const unsigned long duracionApagadoLuz = 5000;   // 5 segundos para apagado lento
+unsigned long tiempoInicio = 0;
+
+// Configuración 555
+const unsigned long PULSO_MIN = 44;     // Valor mínimo medido (μs)
+const unsigned long PULSO_MAX = 7500;   // Valor máximo ajustado a 7600μs
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuración de pines
+  pinMode(pinBotonFisico, INPUT_PULLUP);
+  pinMode(pinControl, OUTPUT);
+  pinMode(pinSensorMH_D0, INPUT);
+  pinMode(pinLuzInterior, OUTPUT);
+  pinMode(pin555, INPUT);
+  pinMode(pinLedR, OUTPUT);
+  pinMode(pinLedG, OUTPUT);
+  pinMode(pinLedB, OUTPUT);
+  digitalWrite(pinControl, LOW);
+
+  RemoteXY_Init();
+  
+  // Configurar PWM
+  ledcAttach(pwmPin, frecuenciaPWM, resolucionPWM);
+  ledcAttach(pwmPin2, frecuenciaPWM, resolucionPWM);
+  ledcWrite(pwmPin, 0);
+  ledcWrite(pwmPin2, 0);  // Inicia apagado
+  ledcAttach(pinLuzInterior, frecuenciaPWM, resolucionPWM);
+  ledcWrite(pinLuzInterior, 0);
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  mostrarPantallaInicio();
+  animacionBienvenida();
+  tiempoInicio = millis();
+
+  Serial.println("Sistema iniciado");
+}
+
+void loop() {
+  RemoteXY_Handler();
+
+  if (!pantallaInicioMostrada && (millis() - tiempoInicio > 3000)) {
+    pantallaInicioMostrada = true;
+    controlarEstadoPuerta();
+    actualizarLCD();
+  }
+
+  // --- Control Manual/Auto ---
+  if (RemoteXY.pushSwitch_01) { // Modo Auto
+    digitalWrite(pinControl, HIGH);
+    if (!pwmApagadoPorTiempo) {  // Solo ajustar PWM si no está apagado por tiempo
+      dutyCycle = map(RemoteXY.slider_01, 0, 100, 0, 255);
+      ledcWrite(pwmPin, dutyCycle);
+      ledcWrite(pwmPin2, dutyCycle);
+    }
+    RemoteXY.circularBar_02 = RemoteXY.slider_01;
+    RemoteXY.circularBar_01 = 0;
+  } 
+  else { // Modo Manual
+    digitalWrite(pinControl, LOW);
+    ledcWrite(pwmPin, 0);  // Apaga primer PWM
+    
+    if (!pwmApagadoPorTiempo) {  // Solo leer 555 si no está apagado por tiempo
+      // Lectura estabilizada del 555 para el segundo PWM
+      unsigned long sumaPulsos = 0;
+      byte muestrasValidas = 0;
+      
+      for (int i = 0; i < 3; i++) {
+        unsigned long pulso = pulseIn(pin555, HIGH, PULSO_MAX * 2);
+        if (pulso >= PULSO_MIN && pulso <= PULSO_MAX) {
+          sumaPulsos += pulso;
+          muestrasValidas++;
+        }
+        delay(10);
+      }
+
+      if (muestrasValidas > 0) {
+        unsigned long promedio = sumaPulsos / muestrasValidas;
+        int pwmValue = constrain(map(promedio, PULSO_MIN, PULSO_MAX, 0, 255), 0, 255);
+        ledcWrite(pwmPin2, pwmValue);
+        RemoteXY.circularBar_01 = map(pwmValue, 0, 255, 0, 100);
+      }
+    }
+    
+    RemoteXY.circularBar_02 = 0;
+  }
+
+  // Control por botón físico
+  if (digitalRead(pinBotonFisico) == LOW) {
+    delay(50);
+    if (digitalRead(pinBotonFisico) == LOW) {
+      estadoPinControl = !estadoPinControl;
+      digitalWrite(pinControl, estadoPinControl);
+      RemoteXY.pushSwitch_01 = estadoPinControl;
+      delay(300);
+    }
+  }
+
+  // Lectura de sensores
+  if (millis() - ultimaLectura > intervaloLectura) {
+    ultimaLectura = millis();
+    float temperatura = dht.readTemperature();
+    float humedad = dht.readHumidity();
+    
+    if (!isnan(temperatura)) RemoteXY.instrument_01 = constrain(temperatura, 0, 100);
+    if (!isnan(humedad)) RemoteXY.instrument_02 = constrain(humedad, 0, 100);
+    
+    if (pantallaInicioMostrada) actualizarLCD();
+  }
+
+  // Control de puerta y temporizadores
+  controlarEstadoPuerta();
+  controlarTemporizadores();
+  actualizarLEDs();
+  controlarLuzInterior();
+
+  delay(20);
+}
+
+// --- Funciones auxiliares ---
+void controlarTemporizadores() {
+  if (puertaAbierta) {
+    // Controlar PWM después de 30 segundos
+    if (!pwmApagadoPorTiempo && (millis() - tiempoPuertaAbierta > tiempoApagarPWM)) {
+      ledcWrite(pwmPin2, 0);  // Apagar segundo PWM
+      pwmApagadoPorTiempo = true;
+      Serial.println("PWM apagado por tiempo (30 segundos)");
+    }
+    
+    // Iniciar apagado de luz después de 1 minuto
+    if (!luzApagadaPorTiempo && !iniciarApagadoLuz && (millis() - tiempoPuertaAbierta > tiempoApagarLuz)) {
+      iniciarApagadoLuz = true;
+      inicioApagadoLuz = millis();
+      Serial.println("Iniciando apagado lento de luz interior");
+    }
+  } else {
+    // Resetear flags cuando se cierra la puerta
+    if (pwmApagadoPorTiempo || iniciarApagadoLuz) {
+      pwmApagadoPorTiempo = false;
+      iniciarApagadoLuz = false;
+      luzApagadaPorTiempo = false;
+      Serial.println("Puerta cerrada - Resetear temporizadores");
+    }
+  }
+}
+
+void controlarLuzInterior() {
+  if (puertaAbierta && !luzApagadaPorTiempo) {
+    if (iniciarApagadoLuz) {
+      // Apagado lento progresivo
+      if (millis() - ultimoCambioLuz > intervaloFadeLuz) {
+        ultimoCambioLuz = millis();
+        float progreso = (float)(millis() - inicioApagadoLuz) / duracionApagadoLuz;
+        brilloLuzInterior = 255 - constrain(progreso * 255, 0, 255);
+        ledcWrite(pinLuzInterior, brilloLuzInterior);
+        
+        if (brilloLuzInterior <= 0) {
+          brilloLuzInterior = 0;
+          luzApagadaPorTiempo = true;
+          iniciarApagadoLuz = false;
+          RemoteXY.led_01 = 0;
+          Serial.println("Luz interior apagada completamente");
+        }
+      }
+    } 
+    else if (brilloLuzInterior < 255) {
+      // Encendido progresivo
+      if (millis() - ultimoCambioLuz > intervaloFadeLuz) {
+        ultimoCambioLuz = millis();
+        brilloLuzInterior = min(brilloLuzInterior + 5, 255);
+        ledcWrite(pinLuzInterior, brilloLuzInterior);
+        RemoteXY.led_01 = 1;
+      }
+    }
+  } 
+  else if ((!puertaAbierta || luzApagadaPorTiempo) && brilloLuzInterior > 0) {
+    // Apagado cuando se cierra la puerta
+    if (millis() - ultimoCambioLuz > intervaloFadeLuz) {
+      ultimoCambioLuz = millis();
+      brilloLuzInterior = max(brilloLuzInterior - 5, 0);
+      ledcWrite(pinLuzInterior, brilloLuzInterior);
+      if (brilloLuzInterior == 0) {
+        RemoteXY.led_01 = 0;
+      }
+    }
+  }
+}
+
+void mostrarPantallaInicio() {
+  lcd.clear();
+  lcd.setCursor(3, 0);  // Centrado exacto (16-10)/2 = 3
+  lcd.print("SmartFridge");
+}
+
+void actualizarLCD() {
+  lcd.clear();
+  
+  // Primera línea: Modo + Cool indicator
+  lcd.setCursor(0, 0);
+  lcd.print(RemoteXY.pushSwitch_01 ? "Auto " : "Manual ");
+  
+  // Calcular barras de Cool (0-4)
+  int pwmValue = RemoteXY.pushSwitch_01 ? RemoteXY.circularBar_02 : RemoteXY.circularBar_01;
+  int coolBars = (pwmValue + 12) / 25; // +12 para redondeo correcto
+  
+  lcd.print("Cool:");
+  for(int i = 0; i < 4; i++) {
+    lcd.print(i < coolBars ? "I" : " ");
+  }
+
+  // Segunda línea: Datos de sensores
+  lcd.setCursor(0, 1);
+  lcd.print("T:");
+  lcd.print(int(RemoteXY.instrument_01));
+  lcd.print("C H:");
+  lcd.print(int(RemoteXY.instrument_02));
+  lcd.print("% ");
+  lcd.print(puertaAbierta ? "A" : "C");
+  if (puertaAbierta && (millis() - tiempoPuertaAbierta > tiempoAlarmaPuerta)) {
+    lcd.print("!");
+  }
+}
+
+void controlarEstadoPuerta() {
+  bool objetoDetectado = digitalRead(pinSensorMH_D0) == LOW;
+  bool puertaEstadoAnterior = puertaAbierta;
+  puertaAbierta = !objetoDetectado;
+  
+  if (puertaAbierta && !puertaEstadoAnterior) {
+    // Puerta acaba de abrirse
+    tiempoPuertaAbierta = millis();
+    pwmApagadoPorTiempo = false;
+    luzApagadaPorTiempo = false;
+    iniciarApagadoLuz = false;
+    Serial.println("Puerta abierta - Iniciando temporizadores");
+  }
+  
+  if (puertaAbierta) {
+    if (millis() - tiempoPuertaAbierta > tiempoAlarmaPuerta) {
+      ledParpadeando = true;
+    }
+  } else {
+    ledParpadeando = false;
+  }
+}
+
+void actualizarLEDs() {
+  static unsigned long ultimoCambio = 0;
+  static bool estadoLED = false;
+  
+  if (!puertaAbierta) {
+    setLEDs(0, 0, 255);  // Azul cuando está cerrado
+  } else if (ledParpadeando) {
+    if (millis() - ultimoCambio > intervaloParpadeo) {
+      ultimoCambio = millis();
+      estadoLED = !estadoLED;
+      setLEDs(estadoLED ? 255 : 0, 0, 0);  // Parpadeo rojo
+    }
+  } else {
+    setLEDs(0, 255, 0);  // Verde cuando está abierto pero sin alarma
+  }
+}
+
+void setLEDs(uint8_t r, uint8_t g, uint8_t b) {
+  analogWrite(pinLedR, r);
+  analogWrite(pinLedG, g);
+  analogWrite(pinLedB, b);
+  RemoteXY.led_01_r = r;
+  RemoteXY.led_01_g = g;
+  RemoteXY.led_01_b = b;
+}
+
+void animacionBienvenida() {
+  unsigned long inicioAnimacion = millis();
+  while (millis() - inicioAnimacion < 3000) {
+    setLEDs(255, 0, 0); delay(300);
+    setLEDs(0, 255, 0); delay(300);
+    setLEDs(0, 0, 255); delay(300);
+    setLEDs(255, 255, 0); delay(300);
+    setLEDs(0, 255, 255); delay(300);
+    setLEDs(255, 0, 255); delay(300);
+    setLEDs(255, 255, 255); delay(300);
+  }
+  setLEDs(0, 0, 0);
+}
